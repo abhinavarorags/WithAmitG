@@ -6,8 +6,8 @@ import os
 import time
 
 # --- Configuration ---
-#FILE_PATH = "/home/amazon/Documents/TAQData/data_trades_2023_12_15.parquet"
-#OUTPUT_DIR = "/home/amazon/Documents/TAQData/processed_output_trades/"
+# FILE_PATH = "/home/amazon/Documents/TAQData/data_trades_2023_12_15.parquet"
+# OUTPUT_DIR = "/home/amazon/Documents/TAQData/processed_output_trades/"
 FILE_PATH = "/home/amazon/Documents/TAQData/data_quotes_2023_12_15.parquet"
 OUTPUT_DIR = "/home/amazon/Documents/TAQData/processed_output_quotes/"
 
