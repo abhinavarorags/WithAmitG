@@ -31,57 +31,53 @@
 # ------------------------------------------------------------------------------
 
 import time
+import argparse
+import shutil
 from pathlib import Path
 import polars as pl
+import argparse
 
 # ---------------- CONFIG ----------------
-MERGED_FILE = Path("/home/amazon/Documents/TAQData/merged_output_top50/merged_all.parquet")
-OUT_DIR = Path("./ms_out")
-OUT_DIR.mkdir(exist_ok=True)
-
+MERGED_FILE = None
+summary_df = None
+metrics_history = None
 K_FWD_TRADES = 10     # event-time lookahead for MR
+
 pl.Config.set_tbl_cols(120)
 pl.Config.set_tbl_width_chars(240)
 
 
 def sanity_check():
+    base = pl.scan_parquet(str(MERGED_FILE))
 
-    # Lazy load merged dataset
-    base = lf = pl.scan_parquet(str(MERGED_FILE))
-    
-    print(f"Null TR_SEQNUM : {  base.filter(pl.col("TR_SEQNUM").is_null()).count().collect().item(0, 0) } ")
+    print(f"Null TR_SEQNUM : {base.filter(pl.col('TR_SEQNUM').is_null()).count().collect(engine='streaming').item(0,0)}")
     base = base.filter(pl.col("TR_SEQNUM").is_not_null())
 
-    print(f"Null QU_SEQNUM : {  base.filter(pl.col("QU_SEQNUM").is_null()).count().collect().item(0, 0) } ")
+    print(f"Null QU_SEQNUM : {base.filter(pl.col('QU_SEQNUM').is_null()).count().collect(engine='streaming').item(0,0)}")
     base = base.filter(pl.col("QU_SEQNUM").is_not_null())
 
-    print(f"Zero BID and ASK : {base.filter((pl.col('BID') == 0) & (pl.col('ASK') == 0)).count().collect().item(0, 0)}")
+    print(f"Zero BID and ASK : {base.filter((pl.col('BID') == 0) & (pl.col('ASK') == 0)).count().collect(engine='streaming').item(0,0)}")
     base = base.filter((pl.col('BID') != 0) & (pl.col('ASK') != 0))
+
     return base
 
-def analyze_ticker(base , ticker: str):
-    """Compute IS / MI / MR statistics for one ticker."""
+
+def analyze_ticker(base, ticker: str, out_dir: Path):
     t0 = time.time()
     ticker = ticker.upper()
     print(f"\n🔎 Running microstructure analysis for: {ticker}")
 
-
-    # Filter to ticker
     base = (
         base.filter(pl.col("SYM_ROOT") == ticker)
-          .sort("TS")
+            .sort("TS")
     )
 
-
-    
-    # ------------------- METRICS PIPELINE -------------------
-    # Build SIDE + ARR_MID (already correct from persist backward-asof)
+    # ---- METRICS PIPELINE ----
     metrics_lf = base.with_columns([
         pl.when(pl.col("PRICE") >= pl.col("MID")).then(1).otherwise(-1).alias("SIDE"),
-        pl.col("MID").shift(0).alias("ARR_MID"),  # backward-asof ensures this matches latest quote
+        pl.col("MID").shift(0).alias("ARR_MID"),
     ])
 
-    # IS_BPS & MI_BPS
     metrics_lf = metrics_lf.with_columns([
         pl.when(pl.col("ARR_MID") > 0)
           .then(10_000 * pl.col("SIDE") * (pl.col("PRICE") - pl.col("ARR_MID")) / pl.col("ARR_MID"))
@@ -94,70 +90,84 @@ def analyze_ticker(base , ticker: str):
           .alias("MI_BPS"),
     ])
 
-    # Lead MID to compute MID_FWD
     metrics_lf = metrics_lf.with_columns([
-        pl.col("MID").shift(-K_FWD_TRADES).alias("MID_FWD")   # negative → look ahead K trades
+        pl.col("MID").shift(-K_FWD_TRADES).alias("MID_FWD")
     ])
 
-    # Filter before computing MR_BPS to avoid infinities
     metrics_lf = metrics_lf.filter(pl.col("MID_FWD") > 0)
 
-    # Compute MR_BPS
     metrics_lf = metrics_lf.with_columns([
         (10_000 * (-pl.col("SIDE")) * (pl.col("MID_FWD") - pl.col("MID")) / pl.col("MID"))
         .alias("MR_BPS")
     ])
 
-    # ------------------- SUMMARY STATISTICS -------------------
-    summary_lf = (
-        metrics_lf.select([
-            pl.len().alias("N_ROWS"),
-            pl.col("SIZE").sum().alias("TOTAL_SIZE"),
-            ((pl.col("PRICE") * pl.col("SIZE")).sum() / pl.col("SIZE").sum()).alias("VWAP"),
-            (pl.col("SPREAD").mean() * 10_000).alias("AVG_SPREAD_BPS"),
-            pl.col("DEPTH_TOB").mean().alias("AVG_DEPTH_TOB"),
+    # ---- SUMMARY ----
+    summary_lf = metrics_lf.select([
+        pl.len().alias("N_ROWS"),
+        pl.col("SIZE").sum().alias("TOTAL_SIZE"),
+        ((pl.col("PRICE") * pl.col("SIZE")).sum() / pl.col("SIZE").sum()).alias("VWAP"),
+        (pl.col("SPREAD").mean() * 10_000).alias("AVG_SPREAD_BPS"),
+        pl.col("DEPTH_TOB").mean().alias("AVG_DEPTH_TOB"),
 
-            pl.col("IS_BPS").mean().alias("IS_MEAN_BPS"),
-            pl.col("IS_BPS").median().alias("IS_MEDIAN_BPS"),
-            pl.col("IS_BPS").min().alias("IS_MIN_BPS"),
-            pl.col("IS_BPS").max().alias("IS_MAX_BPS"),
+        pl.col("IS_BPS").mean().alias("IS_MEAN_BPS"),
+        pl.col("IS_BPS").median().alias("IS_MEDIAN_BPS"),
+        pl.col("IS_BPS").min().alias("IS_MIN_BPS"),
+        pl.col("IS_BPS").max().alias("IS_MAX_BPS"),
 
-            pl.col("MI_BPS").mean().alias("MI_MEAN_BPS"),
-            pl.col("MI_BPS").median().alias("MI_MEDIAN_BPS"),
-            pl.col("MI_BPS").min().alias("MI_MIN_BPS"),
-            pl.col("MI_BPS").max().alias("MI_MAX_BPS"),
+        pl.col("MI_BPS").mean().alias("MI_MEAN_BPS"),
+        pl.col("MI_BPS").median().alias("MI_MEDIAN_BPS"),
+        pl.col("MI_BPS").min().alias("MI_MIN_BPS"),
+        pl.col("MI_BPS").max().alias("MI_MAX_BPS"),
 
-            pl.col("MR_BPS").mean().alias("MR_MEAN_BPS"),
-            pl.col("MR_BPS").median().alias("MR_MEDIAN_BPS"),
-            pl.col("MR_BPS").min().alias("MR_MIN_BPS"),
-            pl.col("MR_BPS").max().alias("MR_MAX_BPS"),
-        ])
-        .with_columns([
-            pl.lit(ticker).alias("TICKER"),
-            pl.lit(K_FWD_TRADES).alias("FWD_TRADES_FOR_MR")
-        ])
-    )
+        pl.col("MR_BPS").mean().alias("MR_MEAN_BPS"),
+        pl.col("MR_BPS").median().alias("MR_MEDIAN_BPS"),
+        pl.col("MR_BPS").min().alias("MR_MIN_BPS"),
+        pl.col("MR_BPS").max().alias("MR_MAX_BPS"),
+    ]).with_columns([
+        pl.lit(ticker).alias("TICKER"),
+        pl.lit(K_FWD_TRADES).alias("FWD_TRADES_FOR_MR")
+    ])
 
-    # Collect summary
-    summary_df = summary_lf.collect(engine="streaming")
-    print(summary_df)
+    summary_df_local = summary_lf.collect(engine="streaming")
+    summary_df_local = summary_df_local.select(['TICKER', pl.all().exclude('TICKER')])
+    print(summary_df_local)
 
-    # Save summary
-    out_csv = OUT_DIR / f"ms_summary_{ticker}.csv"
-    summary_df.write_csv(out_csv)
-    print(f"💾 Saved → {out_csv.resolve()}  |  ⏱ {time.time()-t0:.2f}s")
+    out_csv = out_dir / f"ms_summary_{ticker}.csv"
+    summary_df_local.write_csv(out_csv)
+    print(f"💾 Saved → {out_csv.resolve()} | ⏱ {time.time()-t0:.2f}s")
+    global summary_df, metrics_history
 
-    # Expose objects for notebook inspection
-    globals()["summary_df"] = summary_df
-    globals()["metrics_lf"] = metrics_lf
+    if summary_df is None :
+        summary_df = summary_df_local
+    else:
+        summary_df = summary_df.vstack(summary_df_local).rechunk()
+
+    if metrics_history is None:
+        metrics_history = metrics_lf
+    else:
+        metrics_history = pl.concat([metrics_history,metrics_lf])
+    # globals()["metrics_lf"] = globals()["metrics_lf"].vstack(metrics_lf)
 
 
-def driver():
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--MERGED_FILE", required=True)
+    parser.add_argument("--OUT_DIR", required=True)
+    parser.add_argument("--TICKERS", required=True)
+    args = parser.parse_args()
+
+    out_dir = Path(args.OUT_DIR)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    global MERGED_FILE
+    MERGED_FILE = Path(args.MERGED_FILE)
     base = sanity_check()
-    tickers = ["UBER"]   # change here to evaluate more symbols later
+    tickers = args.TICKERS.split(",") if args.TICKERS else []
+
     for t in tickers:
-        analyze_ticker(base, t)
+        analyze_ticker(base, t, out_dir)
 
 
 if __name__ == "__main__":
-    driver()
+    main()

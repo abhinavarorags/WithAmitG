@@ -1,65 +1,66 @@
 # top50_trades_corresponding_quotes_persist.py
 # -----------------------------------------------------------------------------
-# PURPOSE:
-# Build ONE merged parquet (`merged_all.parquet`) from the top-50 tickers using
-# quote-dominant backward as-of joins:
-#   quotes.TS ≤ trades.TS  (i.e., last quote before the trade)
-#
-# KEY POINTS:
-# • TS is built separately for trades and quotes using full nanosecond precision.
-# • backward ensures strictly backward-in-time matching:
-#       latest quote with TS ≤ trade.TS
-# • tolerance kept at "1s" (per your instruction).
-#   Possible tolerances: "1ns","10ns","100ns","1us","10us","100us",
-#                        "1ms","10ms","100ms","1s"
-# • No filtering of columns — ALL columns are kept.
-# • Data is persisted in one Parquet file with many row groups (~25k rows each).
-# • We DO NOT rely on QU_SEQNUM manually — backward asof handles the “latest”
-#   quote for each trade, including multiple quotes at identical TIME_M.
+# TEMP DEBUG MODS INCLUDED:
+#   1) No silent swallow: print exceptions (first N) with context (symbol/day/hour)
+#   2) TEMP: run only 1 symbol (first symbol in top50) to debug quickly
+#      (remove the TEMP block later)
 # -----------------------------------------------------------------------------
 
 import time
+import shutil
 from datetime import timedelta, date as date_cls
 from pathlib import Path
+
 import polars as pl
 import pyarrow.parquet as pq
 
-# -------------------- Paths & Config --------------------
-TRADES_DIR = Path("/home/amazon/Documents/TAQData/processed_output_trades_upper_top50/")
-QUOTES_DIR = Path("/home/amazon/Documents/TAQData/processed_output_quotes_top50/")
-TOP50_CSV = Path("./stats_out_simple/top50_trades_by_volume.csv")
+import argparse
 
-OUT_DIR = Path("/home/amazon/Documents/TAQData/merged_output_top50/")
+parser = argparse.ArgumentParser()
+parser.add_argument("--TRADES_DIR")
+parser.add_argument("--QUOTES_DIR")
+parser.add_argument("--STATS_DIR")
+parser.add_argument("--TOP50_CSV")
+parser.add_argument("--OUT_DIR")
+parser.add_argument("--OUT_FILE")
+parser.add_argument("--CHUNK_SIZE", type=int)
+args = parser.parse_args()
+
+TRADES_DIR = Path(args.TRADES_DIR)
+QUOTES_DIR = Path(args.QUOTES_DIR)
+TOP50_CSV  = Path(f"{args.STATS_DIR}/{args.TOP50_CSV}")
+
+OUT_DIR = Path(args.OUT_DIR)
+
+# -------------------- CAUTION: WIPE OUT_DIR (prevents accidental append/duplication) --------------------
+if OUT_DIR.exists():
+    shutil.rmtree(OUT_DIR)
+    print(f"[INFO] Deleted existing OUT_DIR before processing: {OUT_DIR}")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_FILE = OUT_DIR / "merged_all.parquet"
 
-CHUNK_SIZE = 25_000
+OUT_FILE = OUT_DIR / args.OUT_FILE
+CHUNK_SIZE = args.CHUNK_SIZE
 
-# Tolerance REQUIRED to be "1s"
-TOLERANCE = "1s"      # Practical values: "1ns","10ns","100ns","1us","10us","100us","1ms","10ms","100ms","1s"
+TOLERANCE = "1s"
 
 pl.Config.set_tbl_cols(120)
 pl.Config.set_tbl_width_chars(220)
 
-
-# ---------------- TS BUILDER (FULL NANO PRECISION) ----------------
-def build_ts_quotes(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Quotes TIME_M is already time64[ns], so TS = DATE + TIME_M (ns)."""
-    return lf.with_columns([
-        (pl.col("DATE").cast(pl.Datetime("ns")) + pl.col("TIME_M").cast(pl.Duration("ns"))).alias("TS")
-    ])
-
-
-def build_ts_trades(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Trades provide time64[us] + time_m_nano(int16) nanosecond remainder."""
+# ---------------- TS BUILDER (SAFE, MICROSECOND-BASED) ----------------
+def build_ts_us(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf.with_columns([
         (
-            pl.col("DATE").cast(pl.Datetime("ns")) +
-            pl.col("TIME_M").cast(pl.Duration("us")).cast(pl.Duration("ns")) +
-            pl.col("TIME_M_NANO").cast(pl.Duration("ns"))
+            pl.col("DATE").cast(pl.Datetime("us")) +
+            pl.duration(
+                hours=pl.col("TIME_M").dt.hour(),
+                minutes=pl.col("TIME_M").dt.minute(),
+                seconds=pl.col("TIME_M").dt.second(),
+                microseconds=(pl.col("TIME_M").dt.nanosecond() // 1_000),
+            )
+            # ---- uncomment ONLY if TIME_M_NANO exists and you want extra ns remainder ----
+            # + pl.col("TIME_M_NANO").cast(pl.Duration("ns"))
         ).alias("TS")
     ])
-
 
 # ---------------- DATE RANGE HELPER ----------------
 def symbol_date_range(sym_root: str, sym_suffix: str):
@@ -76,18 +77,14 @@ def symbol_date_range(sym_root: str, sym_suffix: str):
         return None, None
     return q["min_d"][0], q["max_d"][0]
 
-
 def daterange(a: date_cls, b: date_cls):
     d = a
     while d <= b:
         yield d
         d += timedelta(days=1)
 
-
 # ---------------- PER SYMBOL PER HOUR LAZY JOIN ----------------
 def per_symbol_per_hour_lazy(sym_root: str, sym_suffix: str, day: date_cls, hour: int):
-    """Quotes-left backward asof join (quote-dominant). ALL columns kept."""
-
     quotes_lf = (
         pl.scan_parquet(str(QUOTES_DIR / "*.parquet"))
         .filter(
@@ -108,15 +105,15 @@ def per_symbol_per_hour_lazy(sym_root: str, sym_suffix: str, day: date_cls, hour
         )
     )
 
-    quotes_lf = build_ts_quotes(quotes_lf).with_columns([
+    # Build TS consistently (us-based)
+    quotes_lf = build_ts_us(quotes_lf).with_columns([
         ((pl.col("BID") + pl.col("ASK")) / 2).alias("MID"),
         (pl.col("ASK") - pl.col("BID")).alias("SPREAD"),
         (pl.col("BIDSIZ") + pl.col("ASKSIZ")).alias("DEPTH_TOB"),
     ])
 
-    trades_lf = build_ts_trades(trades_lf)
+    trades_lf = build_ts_us(trades_lf)
 
-    # Critical: BACKWARD ensures quotes.TS ≤ trades.TS (the correct market rule)
     joined = trades_lf.join_asof(
         quotes_lf,
         left_on="TS",
@@ -126,7 +123,6 @@ def per_symbol_per_hour_lazy(sym_root: str, sym_suffix: str, day: date_cls, hour
         tolerance=TOLERANCE,
     )
     return joined
-
 
 # ---------------- MAIN DRIVER ----------------
 def main():
@@ -142,6 +138,13 @@ def main():
     )
     symbols = [(r[0], r[1]) for r in symbols_df.iter_rows()]
 
+    # ---------------- TEMP: RUN ONLY 1 SYMBOL (REMOVE LATER) ----------------
+    if not symbols:
+        raise SystemExit("No symbols found in TOP50 CSV")
+    # symbols = symbols[:1]
+    # print(f"[TEMP] Running only 1 symbol for debug: {symbols[0]}")
+    # -----------------------------------------------------------------------
+
     if OUT_FILE.exists():
         OUT_FILE.unlink()
 
@@ -149,6 +152,9 @@ def main():
     total_rows = 0
     row_groups = 0
     t0 = time.time()
+
+    max_err_print = 30
+    err_printed = 0
 
     for sidx, (root, suf) in enumerate(symbols, start=1):
         tag = f"{root}{('_' + suf) if suf else ''}"
@@ -163,9 +169,46 @@ def main():
             for hr in range(24):
                 shard = per_symbol_per_hour_lazy(root, suf, day, hr)
 
+                # TEMP sanity counts BEFORE join collect (helps pinpoint empty vs failing)
                 try:
-                    out_df = shard.collect(streaming=True)
-                except:
+                    q_cnt = (
+                        pl.scan_parquet(str(QUOTES_DIR / "*.parquet"))
+                        .filter(
+                            (pl.col("SYM_ROOT") == root) &
+                            (pl.col("SYM_SUFFIX").fill_null("") == suf) &
+                            (pl.col("DATE") == day) &
+                            (pl.col("TIME_M").dt.hour() == hr)
+                        )
+                        .select(pl.len().alias("n"))
+                        .collect()
+                    )["n"][0]
+                    t_cnt = (
+                        pl.scan_parquet(str(TRADES_DIR / "*.parquet"))
+                        .filter(
+                            (pl.col("SYM_ROOT") == root) &
+                            (pl.col("SYM_SUFFIX").fill_null("") == suf) &
+                            (pl.col("DATE") == day) &
+                            (pl.col("TIME_M").dt.hour() == hr)
+                        )
+                        .select(pl.len().alias("n"))
+                        .collect()
+                    )["n"][0]
+                except Exception as e:
+                    if err_printed < max_err_print:
+                        print(f"[ERR pre-count] {tag} {day} {hr:02d}:00 -> {type(e).__name__}: {e}")
+                        err_printed += 1
+                    continue
+
+                if (q_cnt == 0) or (t_cnt == 0):
+                    # no data to join
+                    continue
+
+                try:
+                    out_df = shard.collect(engine="streaming")
+                except Exception as e:
+                    if err_printed < max_err_print:
+                        print(f"[ERR collect] {tag} {day} {hr:02d}:00 (q={q_cnt:,} t={t_cnt:,}) -> {type(e).__name__}: {e}")
+                        err_printed += 1
                     continue
 
                 wrote = False
@@ -191,14 +234,13 @@ def main():
                     print(f"    ✅ RG {row_groups:05d}: {tag} {day} {hr:02d}:00 — {n:,} rows")
 
                 if not wrote:
-                    print(f"    · {tag} {day} {hr:02d}:00 — 0 rows")
+                    print(f"    · {tag} {day} {hr:02d}:00 — joined but 0 rows")
 
     if writer:
         writer.close()
 
     print(f"\n🏁 DONE. Total rows={total_rows:,} | row_groups={row_groups:,}")
     print(f"📂 File: {OUT_FILE.resolve()}")
-
 
 if __name__ == "__main__":
     main()

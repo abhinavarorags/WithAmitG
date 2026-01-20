@@ -1,21 +1,39 @@
+# rename.py — Rename trade columns to UPPERCASE (schema preserved)
 import polars as pl
 from pathlib import Path
 from tqdm import tqdm
-import os
+import argparse
 
-TRADES_GLOB = "/home/amazon/Documents/TAQData/processed_output_trades/*.parquet"
-OUT_DIR = Path("/home/amazon/Documents/TAQData/processed_output_trades_upper/")
+parser = argparse.ArgumentParser()
+parser.add_argument("--TRADES_DIR", required=True)
+parser.add_argument("--OUT_DIR", required=True)
+args = parser.parse_args()
+
+TRADES_DIR = Path(args.TRADES_DIR)
+OUT_DIR = Path(args.OUT_DIR)
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-for file in tqdm(list(Path("/home/amazon/Documents/TAQData/processed_output_trades/").glob("*.parquet")),
-                 desc="Renaming to uppercase"):
+print(f"🔁 Renaming columns to UPPERCASE")
+print(f"   Source: {TRADES_DIR}")
+print(f"   Output: {OUT_DIR}")
+
+for file in tqdm(sorted(TRADES_DIR.glob("*.parquet")), desc="Renaming"):
     try:
-        df = pl.read_parquet(file)
-        df = df.rename({c: c.upper() for c in df.columns})
+        # Lazy scan preserves schema exactly
+        lf = pl.scan_parquet(file)
+
+        # Rename columns ONLY (no casts, no computation)
+        lf = lf.rename({c: c.upper() for c in lf.columns})
+
+        # Write back without touching dtypes
         out_file = OUT_DIR / file.name
-        df.write_parquet(out_file, compression="zstd")
+        lf.collect(engine="streaming").write_parquet(
+            out_file,
+            compression="zstd",
+            statistics=True
+        )
+
     except Exception as e:
         print(f"⚠️ Skipped {file.name}: {e}")
 
-print(f"✅ Done. Uppercase trades parquet files saved in: {OUT_DIR}")
-
+print("✅ Done. Column names updated, dtypes unchanged.")
