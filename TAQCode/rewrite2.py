@@ -171,3 +171,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+# main(
+    # IN_FILE="/Users/wanganbo/Desktop/new/data_trades_2024_03_15_upper.parquet",
+    # OUT_DIR="/Users/wanganbo/Desktop/new/processed_output_trades_upper_clean_from_single/",
+    # BATCH_ROWS=25_000,
+#)
+#
